@@ -1,0 +1,35 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isSignedIn() { return request.auth != null; }
+    function isAdmin() {
+      return isSignedIn() && firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role in ['president','super_admin'];
+    }
+    function isImage() { return request.resource.contentType.matches('image/(jpeg|png|webp)'); }
+    // Size is enforced client-side (max 5 MB, src/lib/validation.ts) AND
+    // here: Storage rules check request.resource.size in bytes.
+    function under5MB() { return request.resource.size < 5 * 1024 * 1024; }
+
+    // Private identity documents (CNIC front/back): ONLY the owner, the
+    // President and Super Admins. Never public, never listable by members.
+    // Path: private/{uid}/cnic-front.jpg etc. Download URLs are NOT public:
+    // access is checked on every get via these rules.
+    match /private/{uid}/{fileName} {
+      allow read: if isSignedIn() && (request.auth.uid == uid || isAdmin());
+      allow write: if isSignedIn() && request.auth.uid == uid && isImage() && under5MB();
+      allow delete: if false;
+    }
+    // Profile photos: readable by any signed-in member, writable only by owner.
+    match /profiles/{uid}/{fileName} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn() && request.auth.uid == uid && isImage() && under5MB();
+      allow delete: if isSignedIn() && request.auth.uid == uid;
+    }
+    // Family / record attachments (admin-uploaded only).
+    match /records/{fileName} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin() && isImage() && under5MB();
+    }
+    match /{allPaths=**} { allow read, write: if false; }
+  }
+}

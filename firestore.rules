@@ -1,0 +1,144 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Deny by default: every rule below is an explicit allow.
+    function isSignedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function userDoc() { return get(/databases/$(database)/documents/users/$(uid())).data; }
+    function role() { return isSignedIn() ? userDoc().role : null; }
+    function isPresident() { return role() == 'president'; }
+    function isSuperAdmin() { return role() == 'super_admin'; }
+    function isAssistant() { return role() == 'assistant'; }
+    function isMember() { return role() in ['president','super_admin','assistant','member']; }
+    function isAdmin() { return role() in ['president','super_admin']; }
+    // Clients may NEVER write their own role/status. Only Cloud Functions
+    // (Admin SDK, bypassing rules) may set role, status or approval fields.
+    function noRoleChange() {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role','status','approvedAt','approvedBy']);
+    }
+
+    // --- System / bootstrap flag: readable by anyone (only says whether a
+    // president exists — no PII), writable by NOBODY from a client. The
+    // initializePresident Cloud Function sets it in a transaction. ---
+    match /system/{docId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // --- users: own doc readable/writable (except role/status); admins read all ---
+    match /users/{userId} {
+      allow read: if isSignedIn() && (uid() == userId || isAdmin());
+      allow create: if isSignedIn() && uid() == userId && request.resource.data.role == 'pending';
+      allow update: if isSignedIn() && uid() == userId && noRoleChange();
+      allow delete: if false;
+    }
+
+    // --- member_profiles: readable by any signed-in member; owner edits own
+    // non-sensitive fields; Super Admin may remove (soft-delete) a member ---
+    match /member_profiles/{profileId} {
+      allow read: if isMember();
+      allow create: if isSignedIn() && request.resource.data.uid == uid();
+      allow update: if isSignedIn() && (resource.data.uid == uid() || isAdmin()) && noRoleChange();
+      allow delete: if false; // removal is a soft-delete (active=false) via Function
+    }
+
+    // --- private_identity: CNIC numbers + document URLs. Self + President /
+    // Super Admin of record only. Never listed, never public. ---
+    match /private_identity/{userId} {
+      allow read: if isSignedIn() && (uid() == userId || isPresident() || isSuperAdmin());
+      allow create: if isSignedIn() && uid() == userId;
+      allow update, delete: if false;
+    }
+
+    // --- president (single doc 'president'): readable by members; only Function writes ---
+    match /president/{docId} {
+      allow read: if isMember();
+      allow write: if false;
+    }
+
+    match /super_admins/{docId} { allow read: if isMember(); allow write: if false; }
+    match /assistant_admins/{docId} { allow read: if isMember(); allow write: if false; }
+
+    // --- registration_invitations: M5 — only the creator and the President
+    // may read an invitation record (the raw token is never stored, only its
+    // hash, but the rule was far wider than needed). Token holders do NOT
+    // read the doc directly: checkInvitation / redeemInvitation /
+    // registerApplicant are Cloud Functions (Admin SDK, bypassing rules).
+    // Client may NOT create or mark invitations used — only Functions do. ---
+    match /registration_invitations/{invId} {
+      allow read: if isSignedIn() && (isPresident() || resource.data.createdBy == uid());
+      allow write: if false;
+    }
+
+    // --- Applications: applicant reads own; President reads all super-admin
+    // applications; relevant Super Admin reads assistant/member applications ---
+    match /super_admin_applications/{appId} {
+      allow read: if isSignedIn() && (resource.data.applicantUid == uid() || isPresident());
+      allow create: if isSignedIn() && request.resource.data.applicantUid == uid() && request.resource.data.status == 'pending';
+      allow update, delete: if false; // approval only via approveSuperAdmin Function
+    }
+    match /assistant_applications/{appId} {
+      allow read: if isSignedIn() && (resource.data.applicantUid == uid() || isPresident() || resource.data.superAdminUid == uid());
+      allow create: if isSignedIn() && request.resource.data.applicantUid == uid() && request.resource.data.status == 'pending_super_admin';
+      allow update, delete: if false;
+    }
+    match /member_applications/{appId} {
+      allow read: if isSignedIn() && (resource.data.applicantUid == uid() || isAdmin());
+      allow create: if isSignedIn() && request.resource.data.applicantUid == uid() && request.resource.data.status == 'pending';
+      allow update, delete: if false;
+    }
+
+    // --- families: any member reads APPROVED families; creator + admins read
+    // pending ones. Creation is always status='pending'. Approval via Function. ---
+    match /families/{familyId} {
+      allow read: if isMember() && (resource.data.status == 'approved' || resource.data.createdBy == uid() || isAdmin());
+      allow create: if isSignedIn() && request.resource.data.status == 'pending'
+        && request.resource.data.createdBy == uid();
+      allow update: if isSignedIn() && resource.data.createdBy == uid() && resource.data.status == 'pending'
+        && request.resource.data.status == 'pending' && noRoleChange();
+      allow delete: if false;
+    }
+    match /family_members/{memberId} {
+      allow read: if isMember();
+      allow create: if isSignedIn() && request.resource.data.familyId != null;
+      allow update, delete: if false;
+    }
+    // --- family category votes: one vote per Super Admin per family, enforced
+    // here (doc id = familyId_voterUid) AND in the Function. ---
+    match /family_category_votes/{voteId} {
+      allow read: if isMember();
+      allow create: if isSuperAdmin() && voteId == request.resource.data.familyId + '_' + uid()
+        && request.resource.data.voterUid == uid()
+        && request.resource.data.category in ['upper','middle','third'];
+      allow update, delete: if false;
+    }
+    match /family_categories/{familyId} {
+      allow read: if isMember();
+      allow write: if false; // finalised only by submitFamilyVote Function at 3 matching votes
+    }
+
+    // --- widow / needy / sick: members read; admins create/update; sick
+    // removal is a Function that only deactivates the sick record. ---
+    match /widow_records/{docId} {
+      allow read: if isMember();
+      allow create: if isAdmin() && request.resource.data.status == 'pending';
+      allow update: if isAdmin() && noRoleChange();
+      allow delete: if false;
+    }
+    match /needy_people/{docId} {
+      allow read: if isMember();
+      allow create: if isAdmin();
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+    match /sick_people/{docId} {
+      allow read: if isMember();
+      allow create: if isAdmin();
+      allow update: if isAdmin();
+      allow delete: if false; // use removeSickPerson Function (active=false only)
+    }
+
+    match /approval_records/{docId} { allow read: if isAdmin(); allow write: if false; }
+    match /role_history/{docId} { allow read: if isSignedIn() && (resource.data.uid == uid() || isAdmin()); allow write: if false; }
+  }
+}

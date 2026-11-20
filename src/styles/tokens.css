@@ -1,0 +1,8 @@
+:root {
+  --green: #0B5D3B; --green-dark: #07402A; --green-light: #E6F2EC;
+  --gold: #C9A227; --gold-light: #F7EFD2;
+  --ink: #1C2420; --muted: #5C6B62; --line: #E3E7E3; --bg: #F7F6F1; --card: #FFFFFF;
+  --danger: #B3261E; --radius: 12px; --space: 16px;
+  --font-en: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-ur: 'Noto Nastaliq Urdu', 'Inter', serif;
+}
